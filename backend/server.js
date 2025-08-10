@@ -46,6 +46,7 @@ const waitingQueue = {
 };
 
 const activeConnections = new Map();
+const activeMatches = new Map(); // Track active video matches
 
 // Statistics tracking
 const stats = {
@@ -68,7 +69,7 @@ const addToQueue = (user) => {
     : waitingQueue.any;
   
   queue.add(user);
-  console.log(`User ${user.id} added to ${user.preferredGender || 'any'} queue`);
+  console.log(`✅ User ${user.id} added to ${user.preferredGender || 'any'} queue`);
   logQueueStatus();
 };
 
@@ -76,7 +77,7 @@ const logQueueStatus = () => {
   const queueSizes = Object.entries(waitingQueue).map(([key, queue]) => 
     `${key}: ${queue.size}`
   ).join(', ');
-  console.log(`Queue status: ${queueSizes}`);
+  console.log(`📊 Queue status: ${queueSizes}`);
 };
 
 const findMatch = (user) => {
@@ -106,7 +107,12 @@ const findMatch = (user) => {
       if (isCompatible) {
         removeFromQueue(potentialMatch);
         stats.totalMatches++;
-        console.log(`Match found: ${user.id} <-> ${potentialMatch.id}`);
+        console.log(`🎯 Match found: ${user.id} <-> ${potentialMatch.id}`);
+        
+        // Track active match
+        activeMatches.set(user.id, potentialMatch.id);
+        activeMatches.set(potentialMatch.id, user.id);
+        
         return potentialMatch;
       }
     }
@@ -132,21 +138,25 @@ const cleanupUser = (socketId) => {
         const partner = users.get(partnerConnection.socketId);
         if (partner) {
           delete partner.partnerId;
+          activeMatches.delete(partner.id);
         }
       }
+      
+      // Clean up active match
+      activeMatches.delete(user.id);
     }
     
     users.delete(socketId);
     activeConnections.delete(socketId);
     stats.activeUsers = Math.max(0, stats.activeUsers - 1);
     
-    console.log(`User ${user.id} cleaned up. Active users: ${stats.activeUsers}`);
+    console.log(`🧹 User ${user.id} cleaned up. Active users: ${stats.activeUsers}`);
   }
 };
 
 // Socket connection handling
 io.on('connection', (socket) => {
-  console.log(`New connection: ${socket.id}`);
+  console.log(`🔌 New connection: ${socket.id}`);
   stats.totalConnections++;
   stats.activeUsers++;
   
@@ -159,7 +169,7 @@ io.on('connection', (socket) => {
   
   activeConnections.set(socket.id, connectionData);
 
-  // Heartbeat system
+  // Enhanced heartbeat system
   const heartbeat = setInterval(() => {
     socket.emit('ping');
   }, 30000);
@@ -172,7 +182,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('findPartner', (userData) => {
-    console.log(`Find partner request from ${userData.userId}`);
+    console.log(`🔍 Find partner request from ${userData.userId}`);
     
     const user = {
       id: userData.userId,
@@ -202,11 +212,15 @@ io.on('connection', (socket) => {
       users.set(socket.id, user);
       users.set(match.socketId, match);
       
-      // Notify both users
-      socket.emit('matched', match.socketId);
-      io.to(match.socketId).emit('matched', socket.id);
+      console.log(`🎯 Immediate match: ${user.id} <-> ${match.id}`);
       
-      console.log(`Immediate match: ${user.id} <-> ${match.id}`);
+      // Send match notifications with delay for better WebRTC setup
+      setTimeout(() => {
+        socket.emit('matched', match.socketId);
+        io.to(match.socketId).emit('matched', socket.id);
+        console.log(`📡 Match signals sent`);
+      }, 1000);
+      
     } else {
       // Add to waiting queue
       addToQueue(user);
@@ -215,16 +229,35 @@ io.on('connection', (socket) => {
   });
 
   socket.on('callUser', (data) => {
-    console.log(`Call signal: ${data.from} -> ${data.userToCall}`);
-    io.to(data.userToCall).emit('callUser', {
-      signal: data.signalData,
-      from: data.from
-    });
+    console.log(`📞 Call signal: ${data.from} -> ${data.userToCall}`);
+    
+    // Enhanced call handling with validation
+    const callingUser = users.get(socket.id);
+    const targetSocket = data.userToCall;
+    
+    if (callingUser && targetSocket) {
+      io.to(targetSocket).emit('callUser', {
+        signal: data.signalData,
+        from: data.from,
+        timestamp: Date.now()
+      });
+      
+      console.log(`✅ Call signal forwarded to ${targetSocket}`);
+    } else {
+      console.error(`❌ Invalid call data:`, data);
+    }
   });
 
   socket.on('answerCall', (data) => {
-    console.log(`Answer call: ${socket.id} -> ${data.to}`);
-    io.to(data.to).emit('callAccepted', data.signal);
+    console.log(`📞 Answer call: ${socket.id} -> ${data.to}`);
+    
+    // Enhanced answer handling with validation
+    if (data.to && data.signal) {
+      io.to(data.to).emit('callAccepted', data.signal);
+      console.log(`✅ Call answer forwarded to ${data.to}`);
+    } else {
+      console.error(`❌ Invalid answer data:`, data);
+    }
   });
 
   socket.on('sendMessage', (data) => {
@@ -234,9 +267,10 @@ io.on('connection', (socket) => {
       if (partner) {
         io.to(partner.socketId).emit('message', {
           text: data.text,
-          timestamp: data.timestamp || Date.now()
+          timestamp: data.timestamp || Date.now(),
+          from: user.id
         });
-        console.log(`Message sent from ${user.id} to ${partner.id}`);
+        console.log(`💬 Message sent from ${user.id} to ${partner.id}`);
       }
     }
   });
@@ -244,27 +278,29 @@ io.on('connection', (socket) => {
   socket.on('endCall', () => {
     const user = users.get(socket.id);
     if (user) {
-      console.log(`End call from ${user.id}`);
+      console.log(`❌ End call from ${user.id}`);
       
       if (user.partnerId) {
         const partner = Array.from(users.values()).find(u => u.id === user.partnerId);
         if (partner) {
           io.to(partner.socketId).emit('partnerDisconnected');
           delete partner.partnerId;
+          activeMatches.delete(partner.id);
         }
         delete user.partnerId;
+        activeMatches.delete(user.id);
       }
     }
   });
 
   socket.on('disconnect', (reason) => {
-    console.log(`User disconnected: ${socket.id}, reason: ${reason}`);
+    console.log(`🔌 User disconnected: ${socket.id}, reason: ${reason}`);
     clearInterval(heartbeat);
     cleanupUser(socket.id);
   });
 
   socket.on('error', (error) => {
-    console.error(`Socket error for ${socket.id}:`, error);
+    console.error(`❌ Socket error for ${socket.id}:`, error);
   });
 });
 
@@ -276,25 +312,24 @@ app.get('/', (req, res) => {
   }, {});
 
   res.json({
-    status: 'Omegle Clone Server Running',
+    status: '🎥 Omegle Clone Server Running',
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()),
     stats: {
       ...stats,
-      activeUsers: users.size
+      activeUsers: users.size,
+      activeMatches: activeMatches.size / 2
     },
     queues: queueInfo,
     activeConnections: activeConnections.size,
-    version: '2.0.0'
-  });
-});
-
-app.get('/health', (req, res) => {
-  res.json({
-    healthy: true,
-    timestamp: new Date().toISOString(),
-    activeUsers: users.size,
-    uptime: process.uptime()
+    version: '2.1.0',
+    features: [
+      'WebRTC Video Chat',
+      'Gender Filtering', 
+      'Text Messaging',
+      'Partner Matching',
+      'Mobile Support'
+    ]
   });
 });
 
@@ -315,7 +350,8 @@ app.get('/debug', (req, res) => {
         preferredGender: u.preferredGender
       }));
       return acc;
-    }, {})
+    }, {}),
+    activeMatches: Array.from(activeMatches.entries())
   });
 });
 
@@ -326,7 +362,7 @@ setInterval(() => {
 
   for (const [socketId, connection] of activeConnections.entries()) {
     if (now - connection.lastActivity > timeout) {
-      console.log(`Cleaning up inactive connection: ${socketId}`);
+      console.log(`🧹 Cleaning up inactive connection: ${socketId}`);
       const socket = io.sockets.sockets.get(socketId);
       if (socket) {
         socket.disconnect(true);
@@ -342,15 +378,15 @@ app.get('/ping', (req, res) => {
     pong: true, 
     timestamp: Date.now(),
     uptime: process.uptime(),
-    server: 'Railway'
+    server: 'Railway Enhanced'
   });
 });
 
 const PORT = process.env.PORT || 5000;
 
 server.listen(PORT, () => {
-  console.log(`🚀 Omegle Clone Server running on port ${PORT}`);
-  console.log(`📊 Health check available at: http://localhost:${PORT}/`);
+  console.log(`🚀 Enhanced Omegle Clone Server running on port ${PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/`);
   console.log(`🎯 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🌐 CORS enabled for: https://lambent-biscuit-2313da.netlify.app`);
 });
