@@ -7,33 +7,46 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const server = http.createServer(app);
 
-// CORS configuration
+// Enhanced CORS configuration
 app.use(cors({
   origin: [
     "https://lambent-biscuit-2313da.netlify.app",
-    "http://localhost:3000"
+    "http://localhost:3000",
+    "https://localhost:3000"
   ],
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization"]
 }));
 
+// Additional headers for mobile support
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  next();
+});
+
 app.use(express.json());
 
+// Enhanced socket configuration
 const io = socketIo(server, {
   cors: {
     origin: [
-      "https://lambent-biscuit-2313da.netlify.app", 
-      "http://localhost:3000"
+      "https://lambent-biscuit-2313da.netlify.app",
+      "http://localhost:3000",
+      "https://localhost:3000"
     ],
     methods: ["GET", "POST"],
-    credentials: true
+    credentials: true,
+    allowEIO3: true
   },
   pingTimeout: 60000,
   pingInterval: 25000,
   upgradeTimeout: 30000,
   allowUpgrades: true,
-  transports: ['websocket', 'polling']
+  transports: ['websocket', 'polling'],
+  allowEIO3: true // For older clients
 });
 
 // Enhanced data structures
@@ -44,7 +57,6 @@ const waitingQueue = {
   other: new Set(),
   any: new Set()
 };
-
 const activeConnections = new Map();
 
 // Statistics
@@ -63,8 +75,8 @@ const removeFromQueue = (user) => {
 };
 
 const addToQueue = (user) => {
-  const queue = user.preferredGender && waitingQueue[user.preferredGender] 
-    ? waitingQueue[user.preferredGender] 
+  const queue = user.preferredGender && waitingQueue[user.preferredGender]
+    ? waitingQueue[user.preferredGender]
     : waitingQueue.any;
   
   queue.add(user);
@@ -88,9 +100,9 @@ const findMatch = (user) => {
   for (const potentialMatch of potentialMatches) {
     if (potentialMatch.id !== user.id) {
       const isCompatible = !potentialMatch.preferredGender ||
-                          potentialMatch.preferredGender === 'any' ||
-                          potentialMatch.preferredGender === user.gender ||
-                          !potentialMatch.hasFilterCredit;
+        potentialMatch.preferredGender === 'any' ||
+        potentialMatch.preferredGender === user.gender ||
+        !potentialMatch.hasFilterCredit;
 
       if (isCompatible) {
         removeFromQueue(potentialMatch);
@@ -121,21 +133,26 @@ const cleanupUser = (socketId) => {
         }
       }
     }
-    
+
     users.delete(socketId);
     activeConnections.delete(socketId);
     stats.activeUsers = Math.max(0, stats.activeUsers - 1);
-    
     console.log(`🧹 User ${user.id} cleaned up`);
   }
 };
 
-// Socket connection handling
+// Socket connection handling with timeout
 io.on('connection', (socket) => {
   console.log(`🔌 New connection: ${socket.id}`);
   stats.totalConnections++;
   stats.activeUsers++;
-  
+
+  // Set connection timeout
+  const connectionTimeout = setTimeout(() => {
+    console.log(`⏰ Connection timeout for ${socket.id}`);
+    socket.disconnect(true);
+  }, 300000); // 5 minutes
+
   const connectionData = {
     socketId: socket.id,
     connectedAt: Date.now(),
@@ -165,7 +182,6 @@ io.on('connection', (socket) => {
     }
 
     const match = findMatch(user);
-    
     if (match) {
       user.partnerId = match.id;
       match.partnerId = user.id;
@@ -181,7 +197,6 @@ io.on('connection', (socket) => {
         io.to(match.socketId).emit('matched', socket.id);
         console.log(`📡 Match signals sent`);
       }, 500);
-      
     } else {
       addToQueue(user);
       socket.emit('waiting');
@@ -226,13 +241,15 @@ io.on('connection', (socket) => {
           io.to(partner.socketId).emit('partnerDisconnected');
           delete partner.partnerId;
         }
-        delete user.partnerId;
       }
+      
+      delete user.partnerId;
     }
   });
 
   socket.on('disconnect', (reason) => {
     console.log(`🔌 User disconnected: ${socket.id}, reason: ${reason}`);
+    clearTimeout(connectionTimeout);
     cleanupUser(socket.id);
   });
 
@@ -258,7 +275,7 @@ app.get('/', (req, res) => {
     },
     queues: queueInfo,
     activeConnections: activeConnections.size,
-    version: '3.0.0 - Mobile Optimized'
+    version: '4.0.0 - Mobile Optimized & Enhanced'
   });
 });
 
