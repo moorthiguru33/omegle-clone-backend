@@ -1,7 +1,7 @@
 {
   "name": "omegle-clone-backend",
-  "version": "1.0.0",
-  "description": "Signaling server for Omegle clone",
+  "version": "2.0.0",
+  "description": "Enhanced signaling server for Omegle clone",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -16,5 +16,14 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
-  }
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": [
+    "webrtc",
+    "video-chat",
+    "signaling-server",
+    "omegle-clone"
+  ]
 }
