@@ -7,16 +7,25 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const server = http.createServer(app);
 
-// Enhanced CORS configuration
+// CORS configuration with your Netlify URL
 app.use(cors({
-  origin: ["https://your-netlify-app.netlify.app", "http://localhost:3000"],
-  credentials: true
+  origin: [
+    "https://lambent-biscuit-2313da.netlify.app",
+    "http://localhost:3000"
+  ],
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization"]
 }));
+
 app.use(express.json());
 
 const io = socketIo(server, {
   cors: {
-    origin: "*",
+    origin: [
+      "https://lambent-biscuit-2313da.netlify.app",
+      "http://localhost:3000"
+    ],
     methods: ["GET", "POST"],
     credentials: true
   },
@@ -275,7 +284,8 @@ app.get('/', (req, res) => {
       activeUsers: users.size
     },
     queues: queueInfo,
-    activeConnections: activeConnections.size
+    activeConnections: activeConnections.size,
+    version: '2.0.0'
   });
 });
 
@@ -285,6 +295,27 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     activeUsers: users.size,
     uptime: process.uptime()
+  });
+});
+
+app.get('/debug', (req, res) => {
+  res.json({
+    connectedUsers: Array.from(users.entries()).map(([socketId, user]) => ({
+      socketId,
+      userId: user.id,
+      hasPartner: !!user.partnerId,
+      connectedAt: user.joinedAt,
+      gender: user.gender,
+      preferredGender: user.preferredGender
+    })),
+    waitingQueues: Object.entries(waitingQueue).reduce((acc, [key, queue]) => {
+      acc[key] = Array.from(queue).map(u => ({
+        id: u.id,
+        gender: u.gender,
+        preferredGender: u.preferredGender
+      }));
+      return acc;
+    }, {})
   });
 });
 
@@ -310,7 +341,8 @@ app.get('/ping', (req, res) => {
   res.json({ 
     pong: true, 
     timestamp: Date.now(),
-    uptime: process.uptime() 
+    uptime: process.uptime(),
+    server: 'Railway'
   });
 });
 
@@ -320,6 +352,7 @@ server.listen(PORT, () => {
   console.log(`🚀 Omegle Clone Server running on port ${PORT}`);
   console.log(`📊 Health check available at: http://localhost:${PORT}/`);
   console.log(`🎯 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🌐 CORS enabled for: https://lambent-biscuit-2313da.netlify.app`);
 });
 
 // Graceful shutdown
