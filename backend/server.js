@@ -16,8 +16,10 @@ const io = socketIo(server, {
     origin: "*",
     methods: ["GET", "POST"]
   },
-  pingTimeout: 60000,
-  pingInterval: 25000
+  pingTimeout: 30000,
+  pingInterval: 25000,
+  upgradeTimeout: 10000,
+  allowUpgrades: true
 });
 
 // Store active users and waiting queue
@@ -29,7 +31,29 @@ const waitingQueue = {
   any: []
 };
 
-// Enhanced matching logic for mobile devices
+// Clean up inactive users periodically
+setInterval(() => {
+  const now = Date.now();
+  const timeout = 5 * 60 * 1000; // 5 minutes
+  
+  for (const [socketId, user] of users.entries()) {
+    if (now - user.lastSeen > timeout) {
+      console.log('Cleaning up inactive user:', user.id);
+      removeFromQueue(user);
+      users.delete(socketId);
+    }
+  }
+}, 60000); // Check every minute
+
+// Keep-alive to prevent Railway sleeping
+const keepAlive = () => {
+  setInterval(() => {
+    console.log('Keep-alive ping:', new Date().toISOString(), 'Active users:', users.size);
+  }, 10 * 60 * 1000); // Every 10 minutes
+};
+keepAlive();
+
+// Enhanced matching logic
 const findMatch = (user) => {
   let possibleMatches = [];
   
@@ -46,19 +70,17 @@ const findMatch = (user) => {
     ];
   }
   
-  // Find a match with mobile connection timeout consideration
+  // Find compatible match
   for (let i = 0; i < possibleMatches.length; i++) {
     const potentialMatch = possibleMatches[i];
     
     if (potentialMatch.id !== user.id) {
-      // Check if the match is compatible
       const matchCompatible = !potentialMatch.preferredGender || 
                              potentialMatch.preferredGender === 'any' ||
                              potentialMatch.preferredGender === user.gender ||
                              !potentialMatch.hasFilterCredit;
       
       if (matchCompatible) {
-        // Remove from queue
         removeFromQueue(potentialMatch);
         return potentialMatch;
       }
@@ -75,23 +97,34 @@ const removeFromQueue = (user) => {
 };
 
 const addToQueue = (user) => {
-  // Add to appropriate queue based on gender
   if (user.gender && waitingQueue[user.gender]) {
     waitingQueue[user.gender].push(user);
   } else {
     waitingQueue.any.push(user);
   }
+  console.log('Added to queue:', user.id, 'Queue sizes:', Object.keys(waitingQueue).map(k => `${k}: ${waitingQueue[k].length}`).join(', '));
 };
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
   
-  socket.emit('me', socket.id);
-  
-  // Mobile connection timeout (45 seconds for mobile, 30 for desktop)
+  let heartbeatInterval;
   let connectionTimeout;
   
+  socket.emit('me', socket.id);
+  
+  // Enhanced heartbeat system
+  heartbeatInterval = setInterval(() => {
+    socket.emit('heartbeat', { timestamp: Date.now() });
+  }, 20000);
+  
   socket.on('findPartner', (userData) => {
+    console.log('Find partner request:', userData);
+    
+    if (connectionTimeout) {
+      clearTimeout(connectionTimeout);
+    }
+    
     const user = {
       id: userData.userId,
       socketId: socket.id,
@@ -99,51 +132,49 @@ io.on('connection', (socket) => {
       preferredGender: userData.preferredGender,
       hasFilterCredit: userData.hasFilterCredit,
       isMobile: userData.isMobile || false,
-      connectedAt: Date.now()
+      userAgent: userData.userAgent || '',
+      connectedAt: Date.now(),
+      lastSeen: Date.now()
     };
     
     users.set(socket.id, user);
     
-    // Clear any existing timeout
-    if (connectionTimeout) {
-      clearTimeout(connectionTimeout);
-    }
-    
-    // Set mobile-optimized timeout
+    // Mobile timeout extended to 60 seconds
     connectionTimeout = setTimeout(() => {
+      console.log('Connection timeout for user:', user.id);
       socket.emit('connectionTimeout');
       removeFromQueue(user);
-    }, user.isMobile ? 45000 : 30000);
+    }, user.isMobile ? 60000 : 45000);
     
-    // Try to find a match immediately
+    // Try immediate matching
     const match = findMatch(user);
     
     if (match) {
       console.log('Match found:', user.id, 'with', match.id);
       clearTimeout(connectionTimeout);
       
-      // Store partner IDs for later reference
+      // Set partner relationships
       user.partnerId = match.id;
       match.partnerId = user.id;
+      users.set(socket.id, user);
       users.set(match.socketId, match);
       
-      // Add delay for mobile connection establishment
-      const delay = user.isMobile || match.isMobile ? 1500 : 200;
+      // Staggered connection with mobile optimization
+      const delay = (user.isMobile || match.isMobile) ? 2500 : 1000;
       
       setTimeout(() => {
         socket.emit('matched', match.socketId);
         io.to(match.socketId).emit('matched', socket.id);
+        console.log('Sent match signals with', delay, 'ms delay');
       }, delay);
     } else {
-      // No match found, add to waiting queue
       addToQueue(user);
       socket.emit('waiting');
-      console.log('User added to queue:', user.id);
     }
   });
   
   socket.on('callUser', (data) => {
-    console.log('Call user:', data.userToCall);
+    console.log('Call user:', data.userToCall, 'from:', data.from);
     io.to(data.userToCall).emit('callUser', {
       signal: data.signalData,
       from: data.from
@@ -166,12 +197,12 @@ io.on('connection', (socket) => {
   });
   
   socket.on('endCall', () => {
+    console.log('End call from:', socket.id);
     const user = users.get(socket.id);
     if (user && user.partnerId) {
       const partner = Array.from(users.values()).find(u => u.id === user.partnerId);
       if (partner) {
         io.to(partner.socketId).emit('partnerDisconnected');
-        // Clean up partner references
         delete partner.partnerId;
         users.set(partner.socketId, partner);
       }
@@ -180,20 +211,29 @@ io.on('connection', (socket) => {
     }
   });
   
-  socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.id);
+  socket.on('heartbeat_response', () => {
+    const user = users.get(socket.id);
+    if (user) {
+      user.lastSeen = Date.now();
+      users.set(socket.id, user);
+    }
+  });
+  
+  socket.on('disconnect', (reason) => {
+    console.log('User disconnected:', socket.id, 'Reason:', reason);
     
-    // Clear timeout
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+    }
     if (connectionTimeout) {
       clearTimeout(connectionTimeout);
     }
     
     const user = users.get(socket.id);
     if (user) {
-      // Remove from queue
       removeFromQueue(user);
       
-      // Notify partner if in call
+      // Notify partner
       if (user.partnerId) {
         const partner = Array.from(users.values()).find(u => u.id === user.partnerId);
         if (partner) {
@@ -207,13 +247,12 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Handle connection errors
   socket.on('error', (error) => {
-    console.error('Socket error:', error);
+    console.error('Socket error for', socket.id, ':', error);
   });
 });
 
-// Health check endpoint with mobile-specific stats
+// Health check endpoints
 app.get('/', (req, res) => {
   const mobileUsers = Array.from(users.values()).filter(u => u.isMobile).length;
   const desktopUsers = users.size - mobileUsers;
@@ -229,11 +268,11 @@ app.get('/', (req, res) => {
       other: waitingQueue.other.length,
       any: waitingQueue.any.length
     },
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
   });
 });
 
-// Additional endpoint for debugging
 app.get('/debug', (req, res) => {
   res.json({
     connectedUsers: Array.from(users.entries()).map(([socketId, user]) => ({
@@ -241,21 +280,33 @@ app.get('/debug', (req, res) => {
       userId: user.id,
       isMobile: user.isMobile,
       hasPartner: !!user.partnerId,
-      connectedAt: user.connectedAt
-    }))
+      connectedAt: user.connectedAt,
+      lastSeen: user.lastSeen,
+      gender: user.gender,
+      preferredGender: user.preferredGender
+    })),
+    waitingQueues: waitingQueue
+  });
+});
+
+app.get('/ping', (req, res) => {
+  res.json({ 
+    pong: true,
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
   });
 });
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log('Mobile-optimized signaling server ready');
+  console.log(`Enhanced mobile signaling server running on port ${PORT}`);
+  console.log('Server optimized for mobile WebRTC connections');
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully');
   server.close(() => {
-    console.log('Process terminated');
+    console.log('Server terminated');
   });
 });
