@@ -8,305 +8,497 @@ const app = express();
 const server = http.createServer(app);
 
 // Enhanced CORS configuration
+const allowedOrigins = [
+  "https://lambent-biscuit-2313da.netlify.app",
+  "http://localhost:3000",
+  "https://localhost:3000",
+  /\.netlify\.app$/,
+  /localhost:\d+$/
+];
+
 app.use(cors({
-  origin: [
-    "https://lambent-biscuit-2313da.netlify.app",
-    "http://localhost:3000",
-    "https://localhost:3000"
-  ],
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true);
+    
+    const isAllowed = allowedOrigins.some(allowed => {
+      if (typeof allowed === 'string') {
+        return allowed === origin;
+      }
+      return allowed.test(origin);
+    });
+    
+    if (isAllowed) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept", "Authorization"]
 }));
 
-// Additional headers for mobile support
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-  next();
-});
-
 app.use(express.json());
 
-// Enhanced socket configuration
+// Enhanced Socket.IO configuration
 const io = socketIo(server, {
   cors: {
-    origin: [
-      "https://lambent-biscuit-2313da.netlify.app",
-      "http://localhost:3000",
-      "https://localhost:3000"
-    ],
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
-    credentials: true,
-    allowEIO3: true
+    credentials: true
   },
   pingTimeout: 60000,
   pingInterval: 25000,
   upgradeTimeout: 30000,
   allowUpgrades: true,
   transports: ['websocket', 'polling'],
-  allowEIO3: true // For older clients
+  allowEIO3: true,
+  maxHttpBufferSize: 1e6,
+  httpCompression: true,
+  perMessageDeflate: {
+    threshold: 1024,
+    concurrencyLimit: 20,
+    memLevel: 7
+  }
 });
 
 // Enhanced data structures
-const users = new Map();
-const waitingQueue = {
-  male: new Set(),
-  female: new Set(),
-  other: new Set(),
-  any: new Set()
-};
-const activeConnections = new Map();
-
-// Statistics
-const stats = {
-  totalConnections: 0,
-  activeUsers: 0,
-  totalMatches: 0,
-  successfulCalls: 0
-};
-
-// Utility functions
-const removeFromQueue = (user) => {
-  Object.values(waitingQueue).forEach(queue => {
-    queue.delete(user);
-  });
-};
-
-const addToQueue = (user) => {
-  const queue = user.preferredGender && waitingQueue[user.preferredGender]
-    ? waitingQueue[user.preferredGender]
-    : waitingQueue.any;
-  
-  queue.add(user);
-  console.log(`✅ User ${user.id} added to ${user.preferredGender || 'any'} queue`);
-};
-
-const findMatch = (user) => {
-  let potentialMatches = [];
-
-  if (user.hasFilterCredit && user.preferredGender && user.preferredGender !== 'any') {
-    potentialMatches = Array.from(waitingQueue[user.preferredGender] || []);
-  } else {
-    potentialMatches = [
-      ...Array.from(waitingQueue.male),
-      ...Array.from(waitingQueue.female),
-      ...Array.from(waitingQueue.other),
-      ...Array.from(waitingQueue.any)
-    ];
+class UserManager {
+  constructor() {
+    this.users = new Map();
+    this.waitingQueue = {
+      male: new Set(),
+      female: new Set(), 
+      other: new Set(),
+      any: new Set()
+    };
+    this.activeConnections = new Map();
+    this.statistics = {
+      totalConnections: 0,
+      activeUsers: 0,
+      totalMatches: 0,
+      successfulCalls: 0,
+      peakConcurrentUsers: 0
+    };
   }
 
-  for (const potentialMatch of potentialMatches) {
-    if (potentialMatch.id !== user.id) {
-      const isCompatible = !potentialMatch.preferredGender ||
-        potentialMatch.preferredGender === 'any' ||
-        potentialMatch.preferredGender === user.gender ||
-        !potentialMatch.hasFilterCredit;
+  addUser(socketId, userData) {
+    const user = {
+      id: userData.userId,
+      socketId: socketId,
+      gender: userData.gender,
+      preferredGender: userData.preferredGender,
+      hasFilterCredit: userData.hasFilterCredit,
+      connectedAt: Date.now(),
+      lastActivity: Date.now(),
+      isMatched: false,
+      partnerId: null
+    };
+    
+    this.users.set(socketId, user);
+    this.statistics.activeUsers = this.users.size;
+    this.statistics.peakConcurrentUsers = Math.max(
+      this.statistics.peakConcurrentUsers, 
+      this.statistics.activeUsers
+    );
+    
+    console.log(`✅ User ${user.id} added. Active users: ${this.statistics.activeUsers}`);
+    return user;
+  }
 
-      if (isCompatible) {
-        removeFromQueue(potentialMatch);
-        stats.totalMatches++;
-        console.log(`🎯 Match found: ${user.id} <-> ${potentialMatch.id}`);
-        return potentialMatch;
+  removeUser(socketId) {
+    const user = this.users.get(socketId);
+    if (!user) return null;
+
+    // Remove from waiting queue
+    this.removeFromQueue(user);
+    
+    // Handle partner disconnection
+    if (user.partnerId) {
+      const partner = this.findUserBySocketId(user.partnerId);
+      if (partner) {
+        partner.partnerId = null;
+        partner.isMatched = false;
+        io.to(partner.socketId).emit('partnerDisconnected');
       }
+    }
+
+    this.users.delete(socketId);
+    this.activeConnections.delete(socketId);
+    this.statistics.activeUsers = this.users.size;
+    
+    console.log(`🧹 User ${user.id} removed. Active users: ${this.statistics.activeUsers}`);
+    return user;
+  }
+
+  findUserBySocketId(socketId) {
+    return this.users.get(socketId);
+  }
+
+  addToQueue(user) {
+    if (user.isMatched) return;
+    
+    // Remove from all queues first
+    this.removeFromQueue(user);
+    
+    // Add to appropriate queue
+    let targetQueue = 'any';
+    if (user.hasFilterCredit && user.preferredGender && user.preferredGender !== 'any') {
+      targetQueue = user.preferredGender;
+    }
+    
+    if (this.waitingQueue[targetQueue]) {
+      this.waitingQueue[targetQueue].add(user);
+      console.log(`📥 User ${user.id} added to ${targetQueue} queue (size: ${this.waitingQueue[targetQueue].size})`);
     }
   }
 
-  return null;
-};
+  removeFromQueue(user) {
+    Object.values(this.waitingQueue).forEach(queue => {
+      queue.delete(user);
+    });
+  }
 
-const cleanupUser = (socketId) => {
-  const user = users.get(socketId);
-  if (user) {
-    removeFromQueue(user);
+  findMatch(user) {
+    if (user.isMatched) return null;
+
+    let searchQueues = ['any'];
     
-    if (user.partnerId) {
-      const partnerConnection = Array.from(activeConnections.values())
-        .find(conn => conn.userId === user.partnerId);
-      
-      if (partnerConnection) {
-        io.to(partnerConnection.socketId).emit('partnerDisconnected');
-        const partner = users.get(partnerConnection.socketId);
-        if (partner) {
-          delete partner.partnerId;
+    // If user has filter credits, search specific queue first
+    if (user.hasFilterCredit && user.preferredGender && user.preferredGender !== 'any') {
+      searchQueues = [user.preferredGender, 'any'];
+    } else {
+      // Search all queues for free users
+      searchQueues = ['male', 'female', 'other', 'any'];
+    }
+
+    for (const queueName of searchQueues) {
+      const queue = this.waitingQueue[queueName];
+      if (!queue) continue;
+
+      for (const potentialMatch of queue) {
+        if (potentialMatch.socketId === user.socketId || potentialMatch.isMatched) {
+          continue;
+        }
+
+        // Check compatibility
+        const isCompatible = this.areUsersCompatible(user, potentialMatch);
+        
+        if (isCompatible) {
+          // Remove both users from queues
+          this.removeFromQueue(user);
+          this.removeFromQueue(potentialMatch);
+          
+          // Mark as matched
+          user.isMatched = true;
+          user.partnerId = potentialMatch.socketId;
+          potentialMatch.isMatched = true;
+          potentialMatch.partnerId = user.socketId;
+          
+          this.statistics.totalMatches++;
+          
+          console.log(`🎯 Match found: ${user.id} ↔ ${potentialMatch.id}`);
+          return potentialMatch;
         }
       }
     }
 
-    users.delete(socketId);
-    activeConnections.delete(socketId);
-    stats.activeUsers = Math.max(0, stats.activeUsers - 1);
-    console.log(`🧹 User ${user.id} cleaned up`);
+    return null;
   }
-};
 
-// Socket connection handling with timeout
+  areUsersCompatible(user1, user2) {
+    // Basic compatibility check
+    if (user1.socketId === user2.socketId) return false;
+    if (user1.isMatched || user2.isMatched) return false;
+
+    // Check if user2 accepts user1's gender
+    if (user2.preferredGender && user2.preferredGender !== 'any' && user2.hasFilterCredit) {
+      if (user2.preferredGender !== user1.gender) {
+        return false;
+      }
+    }
+
+    // Check if user1 accepts user2's gender  
+    if (user1.preferredGender && user1.preferredGender !== 'any' && user1.hasFilterCredit) {
+      if (user1.preferredGender !== user2.gender) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  updateUserActivity(socketId) {
+    const user = this.users.get(socketId);
+    if (user) {
+      user.lastActivity = Date.now();
+    }
+  }
+
+  cleanupInactiveUsers() {
+    const now = Date.now();
+    const inactivityThreshold = 5 * 60 * 1000; // 5 minutes
+
+    for (const [socketId, user] of this.users) {
+      if (now - user.lastActivity > inactivityThreshold) {
+        console.log(`🧹 Cleaning up inactive user: ${user.id}`);
+        this.removeUser(socketId);
+        io.to(socketId).disconnect(true);
+      }
+    }
+  }
+
+  getQueueStatus() {
+    const status = {};
+    for (const [queueName, queue] of Object.entries(this.waitingQueue)) {
+      status[queueName] = queue.size;
+    }
+    return status;
+  }
+
+  getStatistics() {
+    return {
+      ...this.statistics,
+      queueStatus: this.getQueueStatus(),
+      uptime: Math.floor(process.uptime()),
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
+const userManager = new UserManager();
+
+// Cleanup inactive users every 2 minutes
+setInterval(() => {
+  userManager.cleanupInactiveUsers();
+}, 2 * 60 * 1000);
+
+// Enhanced socket connection handling
 io.on('connection', (socket) => {
   console.log(`🔌 New connection: ${socket.id}`);
-  stats.totalConnections++;
-  stats.activeUsers++;
+  userManager.statistics.totalConnections++;
+  
+  // Store connection info
+  userManager.activeConnections.set(socket.id, {
+    socketId: socket.id,
+    connectedAt: Date.now(),
+    lastActivity: Date.now()
+  });
 
   // Set connection timeout
   const connectionTimeout = setTimeout(() => {
     console.log(`⏰ Connection timeout for ${socket.id}`);
     socket.disconnect(true);
-  }, 300000); // 5 minutes
+  }, 5 * 60 * 1000); // 5 minutes
 
-  const connectionData = {
-    socketId: socket.id,
-    connectedAt: Date.now(),
-    userId: null,
-    lastActivity: Date.now()
-  };
-  
-  activeConnections.set(socket.id, connectionData);
-
+  // Handle find partner
   socket.on('findPartner', (userData) => {
-    console.log(`🔍 Find partner request from ${userData.userId}`);
-    
-    const user = {
-      id: userData.userId,
-      socketId: socket.id,
-      gender: userData.gender,
-      preferredGender: userData.preferredGender,
-      hasFilterCredit: userData.hasFilterCredit,
-      joinedAt: Date.now()
-    };
-
-    users.set(socket.id, user);
-    
-    const connection = activeConnections.get(socket.id);
-    if (connection) {
-      connection.userId = userData.userId;
-    }
-
-    const match = findMatch(user);
-    if (match) {
-      user.partnerId = match.id;
-      match.partnerId = user.id;
+    try {
+      console.log(`🔍 Find partner request from ${userData.userId}`);
       
-      users.set(socket.id, user);
-      users.set(match.socketId, match);
+      clearTimeout(connectionTimeout);
+      userManager.updateUserActivity(socket.id);
       
-      console.log(`🎯 Immediate match: ${user.id} <-> ${match.id}`);
+      const user = userManager.addUser(socket.id, userData);
+      const match = userManager.findMatch(user);
       
-      // Send match notifications with proper delay
-      setTimeout(() => {
+      if (match) {
+        // Notify both users
+        console.log(`📡 Sending match notifications`);
         socket.emit('matched', match.socketId);
         io.to(match.socketId).emit('matched', socket.id);
-        console.log(`📡 Match signals sent`);
-      }, 500);
-    } else {
-      addToQueue(user);
-      socket.emit('waiting');
-    }
-  });
-
-  socket.on('callUser', (data) => {
-    console.log(`📞 Call signal: ${data.from} -> ${data.userToCall}`);
-    
-    if (data.userToCall && data.signalData && data.from) {
-      io.to(data.userToCall).emit('callUser', {
-        signal: data.signalData,
-        from: data.from,
-        timestamp: Date.now()
-      });
-      console.log(`✅ Call signal forwarded`);
-    } else {
-      console.error(`❌ Invalid call data`);
-    }
-  });
-
-  socket.on('answerCall', (data) => {
-    console.log(`📞 Answer call: ${socket.id} -> ${data.to}`);
-    
-    if (data.to && data.signal) {
-      io.to(data.to).emit('callAccepted', data.signal);
-      stats.successfulCalls++;
-      console.log(`✅ Call answer forwarded`);
-    } else {
-      console.error(`❌ Invalid answer data`);
-    }
-  });
-
-  socket.on('endCall', () => {
-    const user = users.get(socket.id);
-    if (user) {
-      console.log(`❌ End call from ${user.id}`);
-      
-      if (user.partnerId) {
-        const partner = Array.from(users.values()).find(u => u.id === user.partnerId);
-        if (partner) {
-          io.to(partner.socketId).emit('partnerDisconnected');
-          delete partner.partnerId;
-        }
+      } else {
+        // Add to waiting queue
+        userManager.addToQueue(user);
+        socket.emit('waiting');
       }
-      
-      delete user.partnerId;
+    } catch (error) {
+      console.error(`❌ Error in findPartner:`, error);
+      socket.emit('error', { message: 'Failed to find partner' });
     }
   });
 
+  // Handle WebRTC signaling
+  socket.on('offer', (offer) => {
+    try {
+      console.log(`📞 Relaying offer from ${socket.id}`);
+      userManager.updateUserActivity(socket.id);
+      
+      const user = userManager.findUserBySocketId(socket.id);
+      if (user && user.partnerId) {
+        io.to(user.partnerId).emit('offer', offer);
+      }
+    } catch (error) {
+      console.error(`❌ Error relaying offer:`, error);
+    }
+  });
+
+  socket.on('answer', (answer) => {
+    try {
+      console.log(`📞 Relaying answer from ${socket.id}`);
+      userManager.updateUserActivity(socket.id);
+      
+      const user = userManager.findUserBySocketId(socket.id);
+      if (user && user.partnerId) {
+        io.to(user.partnerId).emit('answer', answer);
+        userManager.statistics.successfulCalls++;
+      }
+    } catch (error) {
+      console.error(`❌ Error relaying answer:`, error);
+    }
+  });
+
+  socket.on('ice-candidate', (candidate) => {
+    try {
+      console.log(`📡 Relaying ICE candidate from ${socket.id}`);
+      userManager.updateUserActivity(socket.id);
+      
+      const user = userManager.findUserBySocketId(socket.id);
+      if (user && user.partnerId) {
+        io.to(user.partnerId).emit('ice-candidate', candidate);
+      }
+    } catch (error) {
+      console.error(`❌ Error relaying ICE candidate:`, error);
+    }
+  });
+
+  // Handle call end
+  socket.on('endCall', () => {
+    try {
+      console.log(`❌ End call from ${socket.id}`);
+      userManager.updateUserActivity(socket.id);
+      
+      const user = userManager.findUserBySocketId(socket.id);
+      if (user && user.partnerId) {
+        io.to(user.partnerId).emit('partnerDisconnected');
+        
+        // Reset partner relationship
+        const partner = userManager.findUserBySocketId(user.partnerId);
+        if (partner) {
+          partner.partnerId = null;
+          partner.isMatched = false;
+        }
+        
+        user.partnerId = null;
+        user.isMatched = false;
+      }
+    } catch (error) {
+      console.error(`❌ Error ending call:`, error);
+    }
+  });
+
+  // Handle disconnection
   socket.on('disconnect', (reason) => {
     console.log(`🔌 User disconnected: ${socket.id}, reason: ${reason}`);
+    
     clearTimeout(connectionTimeout);
-    cleanupUser(socket.id);
+    userManager.removeUser(socket.id);
   });
 
+  // Handle errors
   socket.on('error', (error) => {
     console.error(`❌ Socket error for ${socket.id}:`, error);
+    userManager.updateUserActivity(socket.id);
+  });
+
+  // Update activity on any event
+  socket.onAny(() => {
+    userManager.updateUserActivity(socket.id);
   });
 });
 
-// Health check endpoints
+// Enhanced health check endpoints
 app.get('/', (req, res) => {
-  const queueInfo = Object.entries(waitingQueue).reduce((acc, [key, queue]) => {
-    acc[key] = queue.size;
-    return acc;
-  }, {});
-
+  const stats = userManager.getStatistics();
+  
   res.json({
     status: '🎥 Enhanced Omegle Clone Server',
-    timestamp: new Date().toISOString(),
-    uptime: Math.floor(process.uptime()),
-    stats: {
-      ...stats,
-      activeUsers: users.size
+    version: '5.0.0 - Production Ready',
+    timestamp: stats.timestamp,
+    uptime: stats.uptime,
+    statistics: {
+      totalConnections: stats.totalConnections,
+      activeUsers: stats.activeUsers,
+      peakConcurrentUsers: stats.peakConcurrentUsers,
+      totalMatches: stats.totalMatches,
+      successfulCalls: stats.successfulCalls,
+      successRate: stats.totalMatches > 0 ? 
+        ((stats.successfulCalls / stats.totalMatches) * 100).toFixed(2) + '%' : '0%'
     },
-    queues: queueInfo,
-    activeConnections: activeConnections.size,
-    version: '4.0.0 - Mobile Optimized & Enhanced'
+    queues: stats.queueStatus,
+    performance: {
+      memoryUsage: process.memoryUsage(),
+      cpuUsage: process.cpuUsage()
+    }
   });
 });
 
-app.get('/debug', (req, res) => {
+app.get('/health', (req, res) => {
   res.json({
-    connectedUsers: Array.from(users.entries()).map(([socketId, user]) => ({
-      socketId,
-      userId: user.id,
-      hasPartner: !!user.partnerId,
-      connectedAt: user.joinedAt,
-      gender: user.gender,
-      preferredGender: user.preferredGender
-    })),
-    stats,
-    activeConnections: activeConnections.size
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor(process.uptime())
   });
+});
+
+app.get('/stats', (req, res) => {
+  const stats = userManager.getStatistics();
+  res.json(stats);
+});
+
+// Enhanced error handling
+app.use((err, req, res, next) => {
+  console.error('❌ Express error:', err);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+  });
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  console.error('💥 Uncaught Exception:', err);
+  if (process.env.NODE_ENV === 'production') {
+    console.log('📝 Continuing in production mode...');
+  } else {
+    process.exit(1);
+  }
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+  if (process.env.NODE_ENV === 'production') {
+    console.log('📝 Continuing in production mode...');
+  }
 });
 
 const PORT = process.env.PORT || 5000;
 
 server.listen(PORT, () => {
-  console.log(`🚀 Enhanced Mobile Omegle Server running on port ${PORT}`);
-  console.log(`🎯 Optimized for WebRTC mobile video calls`);
-  console.log(`🌐 CORS enabled for: https://lambent-biscuit-2313da.netlify.app`);
+  console.log(`🚀 Enhanced Omegle Server running on port ${PORT}`);
+  console.log(`🎯 Production-ready with advanced features`);
+  console.log(`🌐 CORS enabled for multiple origins`);
+  console.log(`📊 Enhanced monitoring and statistics`);
+  console.log(`🛡️ Improved error handling and resilience`);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully');
+  
   server.close(() => {
-    console.log('✅ Server terminated');
-    process.exit(0);
+    console.log('✅ HTTP server closed');
+    
+    io.close(() => {
+      console.log('✅ Socket.IO server closed');
+      process.exit(0);
+    });
   });
+  
+  setTimeout(() => {
+    console.log('⏰ Force closing after timeout');
+    process.exit(1);
+  }, 10000);
 });
+
+module.exports = { app, server, io, userManager };
