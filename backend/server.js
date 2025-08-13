@@ -7,419 +7,422 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const server = http.createServer(app);
 
-// Enhanced CORS configuration
+// Enhanced CORS configuration for Railway + Netlify
 app.use(cors({
     origin: [
+        "https://lambent-biscuit-2313da.netlify.app",  // Your actual Netlify URL
         "http://localhost:3000",
-        "http://localhost:3001",
-        "https://localhost:3000", 
-        "https://localhost:3001",
-        /^https:\/\/.*\.netlify\.app$/,
-        /^https:\/\/.*\.up\.railway\.app$/,
-        process.env.FRONTEND_URL
-    ].filter(Boolean),
+        "https://*.netlify.app",
+        "https://netlify.app"
+    ],
     credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["*"]
 }));
 
 app.use(express.json());
+app.use(express.static('public'));
 
-// Socket.IO with enhanced configuration
+// Socket.IO with comprehensive configuration
 const io = socketIo(server, {
     cors: {
         origin: [
+            "https://lambent-biscuit-2313da.netlify.app",  // Your actual Netlify URL
             "http://localhost:3000",
-            "http://localhost:3001",
-            "https://localhost:3000",
-            "https://localhost:3001", 
-            /^https:\/\/.*\.netlify\.app$/,
-            /^https:\/\/.*\.up\.railway\.app$/,
-            process.env.FRONTEND_URL
-        ].filter(Boolean),
+            "https://*.netlify.app"
+        ],
         methods: ["GET", "POST"],
-        credentials: true
+        credentials: true,
+        allowEIO3: true
     },
     transports: ['websocket', 'polling'],
     allowEIO3: true,
     pingTimeout: 60000,
-    pingInterval: 25000
+    pingInterval: 25000,
+    upgradeTimeout: 30000,
+    maxHttpBufferSize: 1e6
 });
 
-// Advanced user management system
+// Enhanced data structures for user management
 class UserManager {
     constructor() {
-        this.waitingUsers = new Map();
-        this.connectedUsers = new Map();
-        this.activeRooms = new Map();
-        this.userTimeouts = new Map();
+        this.waitingQueue = new Map();
+        this.activeConnections = new Map();
+        this.userSessions = new Map();
+        this.roomPairs = new Map();
     }
 
-    addUser(socketId, userData) {
-        console.log(`👤 Adding user: ${socketId.slice(-6)} | Gender: ${userData.gender}`);
-        const user = {
+    // Add user to waiting queue
+    addToQueue(socketId, userData) {
+        this.waitingQueue.set(socketId, {
             ...userData,
             socketId,
-            connectedAt: Date.now(),
-            status: 'connected'
-        };
-        this.connectedUsers.set(socketId, user);
-        return user;
-    }
-
-    addToQueue(socketId, userData) {
-        console.log(`⏳ Adding to queue: ${socketId.slice(-6)} | Looking for: ${userData.preferredGender}`);
-        this.clearUserTimeout(socketId);
+            timestamp: Date.now(),
+            queuePosition: this.waitingQueue.size + 1
+        });
         
-        const user = this.connectedUsers.get(socketId);
-        if (user) {
-            user.status = 'waiting';
-            user.waitingSince = Date.now();
-            this.waitingUsers.set(socketId, user);
-
-            const timeoutId = setTimeout(() => {
-                this.removeFromQueue(socketId);
-                const socket = io.sockets.sockets.get(socketId);
-                if (socket) socket.emit('queue-timeout');
-            }, 120000);
-
-            this.userTimeouts.set(socketId, timeoutId);
-        }
+        this.userSessions.set(socketId, {
+            socketId,
+            ...userData,
+            connectedAt: Date.now(),
+            status: 'waiting'
+        });
     }
 
-    findMatch(socketId) {
-        const currentUser = this.connectedUsers.get(socketId);
-        if (!currentUser) return null;
-
-        console.log(`🔍 Finding match for: ${socketId.slice(-6)} (${currentUser.gender} looking for ${currentUser.preferredGender})`);
-
-        for (const [partnerId, partner] of this.waitingUsers) {
-            if (partnerId === socketId) continue;
-
-            const isCompatible = this.checkCompatibility(currentUser, partner);
+    // Find compatible partner
+    findCompatiblePartner(userData) {
+        for (let [socketId, waitingUser] of this.waitingQueue) {
+            if (socketId === userData.socketId) continue;
             
-            if (isCompatible) {
-                console.log(`✅ Match found: ${socketId.slice(-6)} <-> ${partnerId.slice(-6)}`);
-                
-                this.removeFromQueue(socketId);
-                this.removeFromQueue(partnerId);
-                
-                const roomId = uuidv4();
-                const room = {
-                    id: roomId,
-                    user1: currentUser,
-                    user2: partner,
-                    createdAt: Date.now(),
-                    status: 'active'
-                };
-                
-                this.activeRooms.set(roomId, room);
-                
-                currentUser.status = 'matched';
-                currentUser.roomId = roomId;
-                currentUser.partnerId = partnerId;
-                
-                partner.status = 'matched';
-                partner.roomId = roomId;
-                partner.partnerId = socketId;
-                
-                return { partner, roomId };
+            // Check gender preferences
+            const userWants = userData.preferredGender || 'any';
+            const partnerWants = waitingUser.preferredGender || 'any';
+            const userGender = userData.gender;
+            const partnerGender = waitingUser.gender;
+            
+            // Compatibility check
+            const userCompatible = userWants === 'any' || userWants === partnerGender;
+            const partnerCompatible = partnerWants === 'any' || partnerWants === userGender;
+            
+            if (userCompatible && partnerCompatible) {
+                return waitingUser;
             }
         }
         return null;
     }
 
-    checkCompatibility(user1, user2) {
-        const user1WantsUser2 = user1.preferredGender === 'any' || user1.preferredGender === user2.gender;
-        const user2WantsUser1 = user2.preferredGender === 'any' || user2.preferredGender === user1.gender;
-        const user1HasCredits = user1.isPremium || (user1.preferredGender === 'any' || user1.filterCredits > 0);
-        const user2HasCredits = user2.isPremium || (user2.preferredGender === 'any' || user2.filterCredits > 0);
+    // Create room pair
+    createRoom(user1Id, user2Id) {
+        const roomId = uuidv4();
+        this.activeConnections.set(user1Id, user2Id);
+        this.activeConnections.set(user2Id, user1Id);
+        this.roomPairs.set(roomId, { user1: user1Id, user2: user2Id });
         
-        return user1WantsUser2 && user2WantsUser1 && user1HasCredits && user2HasCredits;
-    }
-
-    removeFromQueue(socketId) {
-        this.waitingUsers.delete(socketId);
-        this.clearUserTimeout(socketId);
+        // Remove from queue
+        this.waitingQueue.delete(user1Id);
+        this.waitingQueue.delete(user2Id);
         
-        const user = this.connectedUsers.get(socketId);
-        if (user) {
-            user.status = 'connected';
-            delete user.waitingSince;
+        // Update session status
+        if (this.userSessions.has(user1Id)) {
+            this.userSessions.get(user1Id).status = 'connected';
         }
-    }
-
-    clearUserTimeout(socketId) {
-        const timeoutId = this.userTimeouts.get(socketId);
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-            this.userTimeouts.delete(socketId);
+        if (this.userSessions.has(user2Id)) {
+            this.userSessions.get(user2Id).status = 'connected';
         }
+        
+        return roomId;
     }
 
-    disconnectUser(socketId) {
-        console.log(`👋 User disconnected: ${socketId.slice(-6)}`);
-        
-        const user = this.connectedUsers.get(socketId);
-        if (!user) return null;
+    // Get partner ID
+    getPartnerId(socketId) {
+        return this.activeConnections.get(socketId);
+    }
 
-        this.clearUserTimeout(socketId);
-        this.removeFromQueue(socketId);
+    // Clean up user data
+    cleanupUser(socketId) {
+        const partnerId = this.activeConnections.get(socketId);
         
-        let partnerId = null;
-        if (user.roomId) {
-            const room = this.activeRooms.get(user.roomId);
-            if (room) {
-                partnerId = user.partnerId;
-                
-                const partner = this.connectedUsers.get(partnerId);
-                if (partner) {
-                    delete partner.roomId;
-                    delete partner.partnerId;
-                    partner.status = 'connected';
-                }
-                
-                this.activeRooms.delete(user.roomId);
+        // Clean up partner connection
+        if (partnerId) {
+            this.activeConnections.delete(partnerId);
+        }
+        
+        // Clean up user data
+        this.activeConnections.delete(socketId);
+        this.waitingQueue.delete(socketId);
+        this.userSessions.delete(socketId);
+        
+        // Clean up room pairs
+        for (let [roomId, room] of this.roomPairs) {
+            if (room.user1 === socketId || room.user2 === socketId) {
+                this.roomPairs.delete(roomId);
+                break;
             }
         }
         
-        this.connectedUsers.delete(socketId);
         return partnerId;
     }
 
+    // Get stats
     getStats() {
         return {
-            connected: this.connectedUsers.size,
-            waiting: this.waitingUsers.size,
-            activeRooms: this.activeRooms.size,
-            timestamp: Date.now()
+            activeConnections: this.activeConnections.size / 2, // Divide by 2 since each connection is stored twice
+            waitingQueue: this.waitingQueue.size,
+            totalSessions: this.userSessions.size,
+            activeRooms: this.roomPairs.size
         };
     }
 }
 
+// Initialize user manager
 const userManager = new UserManager();
+
+// Logging utility
+const log = (message, data = null) => {
+    const timestamp = new Date().toISOString();
+    if (data) {
+        console.log(`[${timestamp}] ${message}:`, data);
+    } else {
+        console.log(`[${timestamp}] ${message}`);
+    }
+};
 
 // Socket connection handling
 io.on('connection', (socket) => {
-    console.log(`🔌 New connection: ${socket.id.slice(-6)}`);
-
-    // User joins with profile data
-    socket.on('join', (userData) => {
+    log(`✅ New connection`, { socketId: socket.id, address: socket.handshake.address });
+    
+    // Handle partner search - supporting both event names for compatibility
+    socket.on('find-partner', handleFindPartner);
+    socket.on('findPartner', handleFindPartner);
+    
+    function handleFindPartner(userData) {
         try {
-            console.log(`📝 User join: ${socket.id.slice(-6)}`, userData);
+            log(`🔍 Partner search request`, { 
+                socketId: socket.id, 
+                userId: userData.userId,
+                gender: userData.gender,
+                preferredGender: userData.preferredGender 
+            });
             
+            // Validate user data
             if (!userData || !userData.userId || !userData.gender) {
                 socket.emit('error', { message: 'Invalid user data' });
                 return;
             }
-
-            const user = userManager.addUser(socket.id, userData);
-            socket.emit('joined', { userId: user.userId, status: 'connected' });
             
-        } catch (error) {
-            console.error('Join error:', error);
-            socket.emit('error', { message: 'Failed to join' });
-        }
-    });
-
-    // Find partner
-    socket.on('find-partner', (data) => {
-        try {
-            console.log(`🔍 Find partner request: ${socket.id.slice(-6)}`);
+            // Clean any existing connections
+            const oldPartnerId = userManager.cleanupUser(socket.id);
+            if (oldPartnerId) {
+                io.to(oldPartnerId).emit('partnerDisconnected');
+                log(`🧹 Cleaned up existing connection`, { oldPartnerId });
+            }
             
-            // Store user data first
-            const user = userManager.addUser(socket.id, data);
+            const userInfo = {
+                ...userData,
+                socketId: socket.id,
+                timestamp: Date.now()
+            };
             
-            const match = userManager.findMatch(socket.id);
+            // Look for compatible partner
+            const partner = userManager.findCompatiblePartner(userInfo);
             
-            if (match) {
-                socket.emit('partner-found', {
-                    partnerId: match.partner.socketId,
-                    roomId: match.roomId
+            if (partner) {
+                // Match found - create room
+                const roomId = userManager.createRoom(socket.id, partner.socketId);
+                
+                log(`🎯 Match created`, { 
+                    roomId,
+                    user1: socket.id, 
+                    user2: partner.socketId,
+                    user1Gender: userData.gender,
+                    user2Gender: partner.gender
                 });
                 
-                const partnerSocket = io.sockets.sockets.get(match.partner.socketId);
-                if (partnerSocket) {
-                    partnerSocket.emit('partner-found', {
-                        partnerId: socket.id,
-                        roomId: match.roomId
-                    });
-                }
+                // Notify both users with enhanced data
+                const matchData = {
+                    partnerId: partner.socketId,
+                    roomId: roomId,
+                    partnerGender: partner.gender
+                };
+                
+                const partnerMatchData = {
+                    partnerId: socket.id,
+                    roomId: roomId,
+                    partnerGender: userData.gender
+                };
+                
+                socket.emit('matched', matchData);
+                io.to(partner.socketId).emit('matched', partnerMatchData);
+                
             } else {
-                userManager.addToQueue(socket.id, user);
+                // Add to waiting queue
+                userManager.addToQueue(socket.id, userInfo);
+                const stats = userManager.getStats();
+                
                 socket.emit('waiting', { 
-                    position: userManager.waitingUsers.size,
-                    estimatedWait: Math.min(userManager.waitingUsers.size * 10, 120)
+                    position: userManager.waitingQueue.get(socket.id).queuePosition,
+                    totalWaiting: stats.waitingQueue
+                });
+                
+                log(`⏳ Added to queue`, { 
+                    socketId: socket.id, 
+                    queueSize: stats.waitingQueue,
+                    position: userManager.waitingQueue.get(socket.id).queuePosition
                 });
             }
             
         } catch (error) {
-            console.error('Find partner error:', error);
+            log(`❌ Error in find partner`, { error: error.message, socketId: socket.id });
             socket.emit('error', { message: 'Failed to find partner' });
         }
-    });
+    }
 
-    // WebRTC Signaling Events
-    socket.on('webrtc-offer', (data) => {
-        try {
-            console.log(`📞 WebRTC offer: ${socket.id.slice(-6)} -> ${data.to?.slice(-6)}`);
-            
-            if (!data.to || !data.offer) {
-                socket.emit('error', { message: 'Invalid offer data' });
-                return;
-            }
-
-            const targetSocket = io.sockets.sockets.get(data.to);
-            if (targetSocket) {
-                targetSocket.emit('webrtc-offer', {
-                    from: socket.id,
-                    offer: data.offer
-                });
-            } else {
-                socket.emit('partner-disconnected');
-            }
-            
-        } catch (error) {
-            console.error('WebRTC offer error:', error);
-        }
-    });
-
-    socket.on('webrtc-answer', (data) => {
-        try {
-            console.log(`📱 WebRTC answer: ${socket.id.slice(-6)} -> ${data.to?.slice(-6)}`);
-            
-            if (!data.to || !data.answer) {
-                socket.emit('error', { message: 'Invalid answer data' });
-                return;
-            }
-
-            const targetSocket = io.sockets.sockets.get(data.to);
-            if (targetSocket) {
-                targetSocket.emit('webrtc-answer', {
-                    from: socket.id,
-                    answer: data.answer
-                });
-            } else {
-                socket.emit('partner-disconnected');
-            }
-            
-        } catch (error) {
-            console.error('WebRTC answer error:', error);
-        }
-    });
-
-    socket.on('webrtc-ice-candidate', (data) => {
-        try {
-            if (!data.to || !data.candidate) return;
-
-            const targetSocket = io.sockets.sockets.get(data.to);
-            if (targetSocket) {
-                targetSocket.emit('webrtc-ice-candidate', {
-                    from: socket.id,
-                    candidate: data.candidate
-                });
-            }
-            
-        } catch (error) {
-            console.error('WebRTC ICE candidate error:', error);
-        }
-    });
-
-    // Legacy support for old event names
+    // WebRTC signaling events with enhanced logging
     socket.on('offer', (data) => {
-        socket.emit('webrtc-offer', data);
+        try {
+            const partnerId = userManager.getPartnerId(socket.id);
+            if (partnerId && io.sockets.sockets.get(partnerId)) {
+                io.to(partnerId).emit('offer', data);
+                log(`📞 Offer relayed`, { from: socket.id, to: partnerId });
+            } else {
+                log(`❌ Offer failed - no partner`, { from: socket.id });
+                socket.emit('partnerDisconnected');
+            }
+        } catch (error) {
+            log(`❌ Offer error`, { error: error.message, socketId: socket.id });
+        }
     });
 
     socket.on('answer', (data) => {
-        socket.emit('webrtc-answer', data);
+        try {
+            const partnerId = userManager.getPartnerId(socket.id);
+            if (partnerId && io.sockets.sockets.get(partnerId)) {
+                io.to(partnerId).emit('answer', data);
+                log(`✅ Answer relayed`, { from: socket.id, to: partnerId });
+            } else {
+                log(`❌ Answer failed - no partner`, { from: socket.id });
+                socket.emit('partnerDisconnected');
+            }
+        } catch (error) {
+            log(`❌ Answer error`, { error: error.message, socketId: socket.id });
+        }
     });
 
     socket.on('ice-candidate', (data) => {
-        socket.emit('webrtc-ice-candidate', data);
-    });
-
-    // End call
-    socket.on('end-call', () => {
         try {
-            console.log(`📵 End call: ${socket.id.slice(-6)}`);
-            
-            const user = userManager.connectedUsers.get(socket.id);
-            if (user && user.partnerId) {
-                const partnerSocket = io.sockets.sockets.get(user.partnerId);
-                if (partnerSocket) {
-                    partnerSocket.emit('partner-disconnected');
-                }
-                
-                if (user.roomId) {
-                    userManager.activeRooms.delete(user.roomId);
-                }
-                
-                delete user.roomId;
-                delete user.partnerId;
-                user.status = 'connected';
-                
-                const partner = userManager.connectedUsers.get(user.partnerId);
-                if (partner) {
-                    delete partner.roomId;
-                    delete partner.partnerId;
-                    partner.status = 'connected';
-                }
+            const partnerId = userManager.getPartnerId(socket.id);
+            if (partnerId && io.sockets.sockets.get(partnerId)) {
+                io.to(partnerId).emit('ice-candidate', data);
+                // Reduced logging for ICE candidates to prevent spam
+                // log(`📡 ICE candidate relayed`, { from: socket.id, to: partnerId });
             }
-            
         } catch (error) {
-            console.error('End call error:', error);
+            log(`❌ ICE candidate error`, { error: error.message, socketId: socket.id });
         }
     });
 
-    // User disconnection
+    // Call management
+    socket.on('endCall', () => {
+        try {
+            const partnerId = userManager.cleanupUser(socket.id);
+            if (partnerId) {
+                io.to(partnerId).emit('partnerDisconnected');
+                log(`📞 Call ended`, { by: socket.id, partner: partnerId });
+            }
+        } catch (error) {
+            log(`❌ End call error`, { error: error.message, socketId: socket.id });
+        }
+    });
+
+    // Ping/pong for connection health
+    socket.on('ping', () => {
+        socket.emit('pong');
+    });
+
+    // Connection monitoring
     socket.on('disconnect', (reason) => {
         try {
-            console.log(`🔌 Disconnect: ${socket.id.slice(-6)} (${reason})`);
-            
-            const partnerId = userManager.disconnectUser(socket.id);
-            
+            const partnerId = userManager.cleanupUser(socket.id);
             if (partnerId) {
-                const partnerSocket = io.sockets.sockets.get(partnerId);
-                if (partnerSocket) {
-                    partnerSocket.emit('partner-disconnected');
-                }
+                io.to(partnerId).emit('partnerDisconnected');
             }
-            
+            log(`❌ User disconnected`, { socketId: socket.id, reason, partner: partnerId });
         } catch (error) {
-            console.error('Disconnect error:', error);
+            log(`❌ Disconnect cleanup error`, { error: error.message, socketId: socket.id });
         }
+    });
+
+    // Error handling
+    socket.on('error', (error) => {
+        log(`❌ Socket error`, { socketId: socket.id, error: error.message });
     });
 });
 
-// Health check endpoint
+// Health check and API endpoints
 app.get('/', (req, res) => {
     const stats = userManager.getStats();
     res.json({
         status: 'Omegle Clone Server Running',
-        version: '2.0.0',
-        uptime: process.uptime(),
-        stats,
-        timestamp: new Date().toISOString()
+        version: '3.0.0',
+        timestamp: new Date().toISOString(),
+        uptime: Math.floor(process.uptime()),
+        environment: process.env.NODE_ENV || 'development',
+        stats: {
+            ...stats,
+            memoryUsage: {
+                used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+                total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024)
+            }
+        }
     });
 });
 
-app.get('/api/stats', (req, res) => {
-    res.json(userManager.getStats());
+app.get('/health', (req, res) => {
+    res.status(200).json({ 
+        status: 'healthy', 
+        timestamp: new Date().toISOString() 
+    });
 });
 
+app.get('/stats', (req, res) => {
+    const stats = userManager.getStats();
+    res.json({
+        ...stats,
+        timestamp: new Date().toISOString(),
+        connectedSockets: io.sockets.sockets.size
+    });
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+    log(`❌ Express error`, { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+});
+
+// 404 handler
+app.use((req, res) => {
+    res.status(404).json({ error: 'Endpoint not found' });
+});
+
+// Server startup
 const PORT = process.env.PORT || 5000;
+const HOST = process.env.HOST || '0.0.0.0';
 
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Omegle Clone Server running on port ${PORT}`);
-    console.log(`📊 Stats available at: http://localhost:${PORT}/api/stats`);
+server.listen(PORT, HOST, () => {
+    log(`🚀 Server started`, {
+        port: PORT,
+        host: HOST,
+        environment: process.env.NODE_ENV || 'development',
+        nodeVersion: process.version,
+        cors: 'https://lambent-biscuit-2313da.netlify.app'
+    });
 });
 
+// Graceful shutdown
 process.on('SIGTERM', () => {
-    console.log('🛑 Received SIGTERM, shutting down gracefully');
+    log('🔄 SIGTERM received, shutting down gracefully');
     server.close(() => {
-        console.log('Server closed');
+        log('💀 Process terminated');
         process.exit(0);
     });
 });
 
-module.exports = { app, server };
+process.on('SIGINT', () => {
+    log('🔄 SIGINT received, shutting down gracefully');
+    server.close(() => {
+        log('💀 Process terminated');
+        process.exit(0);
+    });
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    log('❌ Uncaught Exception', { error: error.message, stack: error.stack });
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    log('❌ Unhandled Rejection', { reason, promise });
+});
+
+module.exports = { app, server, userManager };
