@@ -7,7 +7,7 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const server = http.createServer(app);
 
-// Simple CORS configuration
+// Simple CORS setup
 app.use(cors({
     origin: [
         "https://lambent-biscuit-2313da.netlify.app",
@@ -29,7 +29,7 @@ const io = socketIo(server, {
     }
 });
 
-// Simple Queue Class
+// Simple Queue Implementation
 class Queue {
     constructor() {
         this.storage = [];
@@ -63,24 +63,23 @@ class Queue {
 class RoomManager {
     constructor(io) {
         this.rooms = new Map();
-        this.io = io;
         this.queue = new Queue();
+        this.io = io;
         this.userCount = 0;
     }
 
     async addUser(socketId) {
-        // Add small delay like friend's app
+        // Small delay like friend's app for stability
         await new Promise(resolve => setTimeout(resolve, 1000));
         
         this.userCount++;
-        console.log(`User ${socketId} added. Total users: ${this.userCount}`);
+        console.log(`User ${socketId} joined. Total: ${this.userCount}`);
         
         this.queue.enqueue({ id: socketId });
         console.log(`Queue size: ${this.queue.size()}`);
 
-        // Try to match users
         if (this.queue.size() >= 2) {
-            console.log("Pair found!");
+            console.log(":: Pair found ::");
             const user1 = this.queue.dequeue();
             const user2 = this.queue.dequeue();
 
@@ -91,7 +90,7 @@ class RoomManager {
                 console.log(`Room ${roomId} created for ${user1.id} and ${user2.id}`);
             }
         } else {
-            console.log("No pair found, user waiting in queue");
+            console.log("NO PAIR FOUND - User waiting");
         }
 
         this.io.emit('user-count', this.userCount);
@@ -104,22 +103,22 @@ class RoomManager {
     }
 
     handleOffer(socketId, roomId, offer) {
-        console.log(`Offer from ${socketId} for room ${roomId}`);
+        console.log(`OFFER from ${socketId} for room ${roomId}`);
         const room = this.rooms.get(roomId);
         if (!room) return;
 
         const receiver = room.user1.id === socketId ? room.user2.id : room.user1.id;
-        console.log(`Sending offer to ${receiver}`);
+        console.log(`SENDING OFFER TO ${receiver}`);
         this.io.to(receiver).emit('offer', offer);
     }
 
     handleAnswer(socketId, roomId, answer) {
-        console.log(`Answer from ${socketId} for room ${roomId}`);
+        console.log(`ANSWER from ${socketId} for room ${roomId}`);
         const room = this.rooms.get(roomId);
         if (!room) return;
 
         const receiver = room.user1.id === socketId ? room.user2.id : room.user1.id;
-        console.log(`Sending answer to ${receiver}`);
+        console.log(`SENDING ANSWER TO ${receiver}`);
         this.io.to(receiver).emit('answer', answer);
     }
 
@@ -140,7 +139,7 @@ class RoomManager {
     }
 
     handleDisconnect(socketId) {
-        console.log(`User ${socketId} disconnected`);
+        console.log(`DISCONNECTED: ${socketId}`);
         
         // Remove from queue
         const itemToRemove = this.queue.find(socketId);
@@ -151,10 +150,10 @@ class RoomManager {
 
         this.userCount--;
 
-        // Handle room cleanup
+        // Clean up rooms
         this.rooms.forEach((room, roomId) => {
             if (room.user1.id === socketId || room.user2.id === socketId) {
-                console.log(`Cleaning up room ${roomId}`);
+                console.log(`DELETING ROOM: ${roomId}`);
                 this.rooms.delete(roomId);
                 this.io.to(room.user1.id).to(room.user2.id).emit('leaveRoom');
             }
@@ -164,10 +163,11 @@ class RoomManager {
     }
 
     handleLeaveRoom(socketId) {
-        console.log(`Leave room request from ${socketId}`);
+        console.log(`LEAVE ROOM REQUEST FROM: ${socketId}`);
         this.rooms.forEach((room, roomId) => {
             if (room.user1.id === socketId || room.user2.id === socketId) {
                 this.rooms.delete(roomId);
+                console.log(`DELETING ROOM: ${roomId}`);
                 this.io.to(room.user1.id).to(room.user2.id).emit('leaveRoom');
             }
         });
@@ -176,41 +176,46 @@ class RoomManager {
 
 const roomManager = new RoomManager(io);
 
-// Socket connection handling
+// Socket Connection Handling
 io.on('connection', (socket) => {
-    console.log(`User connected: ${socket.id}`);
+    console.log(`user connected: ${socket.id}`);
 
     socket.on('join', () => {
-        console.log(`User joined: ${socket.id}`);
+        console.log(`user joined: ${socket.id}`);
         roomManager.addUser(socket.id);
     });
 
-    socket.on('offer', (roomId, offer) => {
-        roomManager.handleOffer(socket.id, roomId, offer);
-    });
-
-    socket.on('answer', (roomId, answer) => {
-        roomManager.handleAnswer(socket.id, roomId, answer);
-    });
-
-    socket.on('ice-candidates', (roomId, iceCandidate) => {
-        roomManager.handleIceCandidates(socket.id, roomId, iceCandidate);
+    socket.on('disconnect', () => {
+        console.log(`user disconnected: ${socket.id}`);
+        roomManager.handleDisconnect(socket.id);
     });
 
     socket.on('message', (roomId, message) => {
         roomManager.handleMessage(roomId, socket.id, message);
     });
 
-    socket.on('leaveRoom', () => {
-        roomManager.handleLeaveRoom(socket.id);
+    socket.on('offer', (roomId, offer) => {
+        console.log('offer received');
+        roomManager.handleOffer(socket.id, roomId, offer);
     });
 
-    socket.on('disconnect', () => {
-        roomManager.handleDisconnect(socket.id);
+    socket.on('answer', (roomId, answer) => {
+        console.log('answer received');
+        roomManager.handleAnswer(socket.id, roomId, answer);
+    });
+
+    socket.on('ice-candidates', (roomId, iceCandidate) => {
+        console.log('ice-candidates received');
+        roomManager.handleIceCandidates(socket.id, roomId, iceCandidate);
+    });
+
+    socket.on('leaveRoom', () => {
+        console.log(`LEAVE ROOM REQUEST FROM ${socket.id}`);
+        roomManager.handleLeaveRoom(socket.id);
     });
 });
 
-// Simple health check
+// Health check endpoint
 app.get('/', (req, res) => {
     res.json({
         status: 'OmeLive Server Online',
@@ -222,5 +227,5 @@ app.get('/', (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`listening on port: ${PORT}`);
 });
