@@ -9,7 +9,4 @@
 [environments.production]
   PORT = "5000"
   NODE_ENV = "production"
-
-[environments.development]
-  PORT = "5000"
-  NODE_ENV = "development"
+  FRONTEND_URL = "https://lambent-biscuit-2313da.netlify.app"
