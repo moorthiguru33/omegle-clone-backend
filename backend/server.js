@@ -117,7 +117,13 @@ class UserManager {
       partnerId: null,
       country: userData.country || 'unknown',
       userAgent: userData.userAgent || 'unknown',
-      reportCount: 0
+      reportCount: 0,
+      // Browser detection
+      isMobile: userData.browserInfo?.isMobile || false,
+      isSafari: userData.browserInfo?.isSafari || false,
+      isIOS: userData.browserInfo?.isIOS || false,
+      isAndroid: userData.browserInfo?.isAndroid || false,
+      browserType: userData.browserInfo ? this.detectBrowser(userData.browserInfo) : 'unknown'
     };
 
     this.users.set(socketId, user);
@@ -128,8 +134,18 @@ class UserManager {
       this.statistics.activeUsers
     );
 
-    console.log(`[SUCCESS] User ${user.id} added (${user.gender}). Active users: ${this.statistics.activeUsers}`);
+    console.log(`[SUCCESS] User ${user.id} added (${user.gender}, ${user.browserType}). Active users: ${this.statistics.activeUsers}`);
     return user;
+  }
+
+  detectBrowser(browserInfo) {
+    if (browserInfo.isIOS) return 'iOS Safari';
+    if (browserInfo.isSafari) return 'Safari';
+    if (browserInfo.isChrome) return 'Chrome';
+    if (browserInfo.isFirefox) return 'Firefox';
+    if (browserInfo.isEdge) return 'Edge';
+    if (browserInfo.isAndroid) return 'Android';
+    return 'Unknown';
   }
 
   removeUser(socketId) {
@@ -228,7 +244,7 @@ class UserManager {
           potentialMatch.partnerId = user.socketId;
           
           this.statistics.totalMatches++;
-          console.log(`[MATCH] Match found: ${user.id} <-> ${potentialMatch.id}`);
+          console.log(`[MATCH] Match found: ${user.id} (${user.browserType}) <-> ${potentialMatch.id} (${potentialMatch.browserType})`);
           return potentialMatch;
         }
       }
@@ -254,6 +270,44 @@ class UserManager {
     }
 
     return true;
+  }
+
+  getConnectionStrategy(user1, user2) {
+    // Different strategies based on browser combinations
+    if (user1.isIOS || user2.isIOS) {
+      return {
+        type: 'ios_compatible',
+        iceTimeout: 25000,
+        usePolite: true,
+        forceRelay: true, // Force TURN for iOS
+        constraints: {
+          video: { width: { max: 640 }, height: { max: 480 } },
+          audio: true
+        }
+      };
+    } else if (user1.isSafari || user2.isSafari) {
+      return {
+        type: 'safari_compatible',
+        iceTimeout: 20000,
+        usePolite: true,
+        constraints: {
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: true
+        }
+      };
+    } else if (user1.isMobile || user2.isMobile) {
+      return {
+        type: 'mobile_optimized',
+        iceTimeout: 15000,
+        constraints: {
+          video: { width: { max: 854 }, height: { max: 480 } }
+        }
+      };
+    }
+    return {
+      type: 'standard',
+      iceTimeout: 12000
+    };
   }
 
   updateUserActivity(socketId) {
@@ -411,11 +465,11 @@ io.on('connection', (socket) => {
     userManager.updateUserActivity(socket.id);
   };
 
-  // Enhanced find partner handler with detailed logging
+  // Enhanced find partner handler with browser detection
   socket.on('findPartner', (userData) => {
     try {
       console.log(`[FIND_PARTNER] Request from ${userData.userId} (${socket.id})`);
-      console.log(`[USER_DATA] Gender: ${userData.gender}, Preference: ${userData.preferredGender}, Has Credits: ${userData.hasFilterCredit}`);
+      console.log(`[USER_DATA] Gender: ${userData.gender}, Preference: ${userData.preferredGender}, Browser: ${userData.browserInfo?.browserType || 'unknown'}`);
       
       clearTimeoutOnActivity();
 
@@ -450,13 +504,25 @@ io.on('connection', (socket) => {
 
       if (match) {
         console.log(`[MATCH_FOUND] ${user.id} matched with ${match.id}`);
-        console.log(`[MATCH_DETAILS] User1: ${user.gender}->${user.preferredGender}, User2: ${match.gender}->${match.preferredGender}`);
+        console.log(`[MATCH_DETAILS] User1: ${user.gender}->${user.preferredGender} (${user.browserType}), User2: ${match.gender}->${match.preferredGender} (${match.browserType})`);
 
-        // Send match notifications with partner info
+        // Get connection strategy based on browsers
+        const connectionStrategy = userManager.getConnectionStrategy(user, match);
+        console.log(`[STRATEGY] Connection strategy: ${connectionStrategy.type}`);
+
+        // Send enhanced match notifications
         socket.emit('matched', {
           partnerId: match.socketId,
           partnerGender: match.gender,
-          matchTime: Date.now()
+          partnerBrowser: {
+            isMobile: match.isMobile,
+            isSafari: match.isSafari,
+            isIOS: match.isIOS,
+            type: match.browserType
+          },
+          connectionStrategy: connectionStrategy,
+          matchTime: Date.now(),
+          isPolite: socket.id < match.socketId // Polite/impolite pattern
         });
 
         const partnerSocket = io.sockets.sockets.get(match.socketId);
@@ -464,12 +530,19 @@ io.on('connection', (socket) => {
           partnerSocket.emit('matched', {
             partnerId: socket.id,
             partnerGender: user.gender,
-            matchTime: Date.now()
+            partnerBrowser: {
+              isMobile: user.isMobile,
+              isSafari: user.isSafari,
+              isIOS: user.isIOS,
+              type: user.browserType
+            },
+            connectionStrategy: connectionStrategy,
+            matchTime: Date.now(),
+            isPolite: match.socketId < socket.id // Polite/impolite pattern
           });
           console.log(`[SUCCESS] Match notifications sent to both users`);
         } else {
           console.error(`[ERROR] Partner socket not available: ${match.socketId}`);
-          // Clean up the match
           user.isMatched = false;
           user.partnerId = null;
           match.isMatched = false;
@@ -496,7 +569,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Enhanced WebRTC signaling handlers with detailed logging
+  // Enhanced WebRTC signaling handlers
   socket.on('offer', (offer) => {
     try {
       clearTimeoutOnActivity();
@@ -529,7 +602,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      console.log(`[WEBRTC] Relaying offer from ${socket.id} (${user.id}) to ${user.partnerId}`);
+      console.log(`[WEBRTC] Relaying offer from ${socket.id} (${user.browserType}) to ${user.partnerId}`);
       console.log(`[WEBRTC] Offer type: ${offer.type}, SDP length: ${offer.sdp.length}`);
 
       partnerSocket.emit('offer', offer);
@@ -572,7 +645,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      console.log(`[WEBRTC] Relaying answer from ${socket.id} (${user.id}) to ${user.partnerId}`);
+      console.log(`[WEBRTC] Relaying answer from ${socket.id} (${user.browserType}) to ${user.partnerId}`);
       console.log(`[WEBRTC] Answer type: ${answer.type}, SDP length: ${answer.sdp.length}`);
 
       partnerSocket.emit('answer', answer);
@@ -716,8 +789,8 @@ io.on('connection', (socket) => {
   socket.emit('connected', {
     serverId: process.env.RAILWAY_SERVICE_ID || 'local',
     serverTime: Date.now(),
-    features: ['video', 'audio', 'gender-filter', 'reporting', 'auto-moderation'],
-    version: '6.0.0'
+    features: ['video', 'audio', 'gender-filter', 'reporting', 'auto-moderation', 'cross-browser'],
+    version: '7.0.0'
   });
 });
 
@@ -727,7 +800,7 @@ app.get('/', (req, res) => {
   const distribution = userManager.getUserDistribution();
   res.json({
     status: 'Enhanced Omegle Clone Server - ONLINE',
-    version: '6.0.0 - Production Ready',
+    version: '7.0.0 - Cross-Browser Compatible',
     timestamp: stats.timestamp,
     uptime: `${Math.floor(stats.uptime / 3600)}h ${Math.floor((stats.uptime % 3600) / 60)}m`,
     environment: process.env.NODE_ENV || 'development',
@@ -756,12 +829,14 @@ app.get('/', (req, res) => {
     },
     features: [
       'WebRTC Video Chat',
+      'Cross-Browser Support',
+      'Mobile Optimization',
       'Gender Filtering',
       'Auto-Moderation',
       'Real-time Matching',
-      'Mobile Support',
       'User Reporting',
-      'Automatic Cleanup'
+      'iOS Safari Support',
+      'Android Support'
     ]
   });
 });
@@ -876,11 +951,11 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[SERVER] Enhanced Omegle Server running on port ${PORT}`);
+  console.log(`[SERVER] Enhanced Cross-Browser Omegle Server running on port ${PORT}`);
   console.log(`[ENV] Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`[CORS] CORS enabled for ${allowedOrigins.length} origins`);
-  console.log(`[FEATURES] Enhanced monitoring, auto-moderation, and security enabled`);
-  console.log(`[READY] Server ready to accept connections`);
+  console.log(`[FEATURES] Cross-browser compatibility, enhanced monitoring, and auto-moderation enabled`);
+  console.log(`[READY] Server ready to accept connections from all browsers and devices`);
 });
 
 module.exports = { app, server, io, userManager };
