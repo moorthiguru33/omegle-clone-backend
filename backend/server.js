@@ -7,265 +7,220 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const server = http.createServer(app);
 
-// CORS configuration
-const allowedOrigins = [
-  "https://lambent-biscuit-2313da.netlify.app",
-  "http://localhost:3000",
-  "https://localhost:3000",
-  /\.netlify\.app$/,
-  /localhost:\d+$/,
-  process.env.FRONTEND_URL,
-  "*" // Allow all origins for development
-].filter(Boolean);
-
+// Simple CORS configuration
 app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST"],
-  credentials: true,
+    origin: [
+        "https://lambent-biscuit-2313da.netlify.app",
+        "http://localhost:3000",
+        "https://localhost:3000"
+    ],
+    credentials: true,
+    methods: ["GET", "POST"]
 }));
 
 const io = socketIo(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-    credentials: true,
-  },
-  pingTimeout: 60000,
-  pingInterval: 25000,
-  transports: ['websocket', 'polling']
+    cors: {
+        origin: [
+            "https://lambent-biscuit-2313da.netlify.app",
+            "http://localhost:3000"
+        ],
+        methods: ["GET", "POST"],
+        credentials: true
+    }
 });
 
-// Queue implementation (from Queue.ts)
+// Simple Queue Class
 class Queue {
-  constructor(capacity = Infinity) {
-    this.storage = [];
-    this.capacity = capacity;
-  }
-
-  enqueue(item) {
-    if (this.size() === this.capacity) {
-      throw new Error("Queue has reached max capacity, you cannot add more items");
+    constructor() {
+        this.storage = [];
     }
-    this.storage.push(item);
-  }
 
-  dequeue() {
-    return this.storage.shift();
-  }
-
-  size() {
-    return this.storage.length;
-  }
-
-  remove(item) {
-    const index = this.storage.findIndex(elem => elem.id === item.id);
-    if (index !== -1) {
-      this.storage.splice(index, 1);
+    enqueue(item) {
+        this.storage.push(item);
     }
-  }
 
-  find(id) {
-    return this.storage.find(item => item.id === id);
-  }
+    dequeue() {
+        return this.storage.shift();
+    }
 
-  printQueue() {
-    console.log("Current Queue:");
-    console.log(this.storage);
-  }
+    size() {
+        return this.storage.length;
+    }
+
+    remove(item) {
+        const index = this.storage.findIndex(elem => elem.id === item.id);
+        if (index !== -1) {
+            this.storage.splice(index, 1);
+        }
+    }
+
+    find(id) {
+        return this.storage.find(item => item.id === id);
+    }
 }
 
-// Room Manager (from Room.ts)
+// Simple Room Manager
 class RoomManager {
-  constructor(io) {
-    this.rooms = new Map();
-    this.io = io;
-    this.queue = new Queue();
-    this.numOfPlayers = 0;
-  }
-
-  createRoom(user1, user2) {
-    const roomId = uuidv4();
-    this.rooms.set(roomId, { user1, user2 });
-    return roomId;
-  }
-
-  async addUser(socketId) {
-    // Add 3-second delay like reference code to prevent rapid connections
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    
-    this.numOfPlayers++;
-    console.log(`Number of players --> ${socketId} => ${this.numOfPlayers}`);
-    
-    this.queue.enqueue({ id: socketId });
-    console.log(`PLAYERS IN QUEUE -> ${this.queue.size()}`);
-    
-    if (this.queue.size() > 1) {
-      console.log(":: Pair found ::");
-      const user1 = this.queue.dequeue();
-      const user2 = this.queue.dequeue();
-      
-      if (user1 && user2) {
-        console.log("requesting offer");
-        const room = this.createRoom(user1, user2);
-        
-        // Notify both users they joined a room
-        this.io.to(user1.id).to(user2.id).emit('joined', { room });
-        
-        // Request the first user to send offer (critical for connection flow)
-        this.io.to(user1.id).emit("send-offer");
-        console.log(`sent offer request to :: ${user1.id}`);
-      }
-    } else {
-      console.log("NO PAIR FOUND");
+    constructor(io) {
+        this.rooms = new Map();
+        this.io = io;
+        this.queue = new Queue();
+        this.userCount = 0;
     }
-    
-    // Broadcast user count to all clients
-    this.io.emit("user-count", this.numOfPlayers);
-  }
 
-  handleOffer(socketId, roomId, offer) {
-    console.log(`OFFER SENT BY :: ${socketId} FOR ROOM :: ${roomId}`);
-    const room = this.rooms.get(roomId);
-    if (!room) return;
-    
-    const receiver = room.user1.id === socketId ? room.user2.id : room.user1.id;
-    console.log(`SENDING OFFER TO :: ${receiver}`);
-    this.io.to(receiver).emit("offer", offer);
-  }
+    async addUser(socketId) {
+        // Add small delay like friend's app
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        this.userCount++;
+        console.log(`User ${socketId} added. Total users: ${this.userCount}`);
+        
+        this.queue.enqueue({ id: socketId });
+        console.log(`Queue size: ${this.queue.size()}`);
 
-  handleAnswer(socketId, roomId, answer) {
-    const room = this.rooms.get(roomId);
-    if (!room) return;
-    
-    const receiver = room.user1.id === socketId ? room.user2.id : room.user1.id;
-    console.log(`RECEIVED ANSWER SENDING TO :: ${receiver}`);
-    this.io.to(receiver).emit("answer", answer);
-  }
+        // Try to match users
+        if (this.queue.size() >= 2) {
+            console.log("Pair found!");
+            const user1 = this.queue.dequeue();
+            const user2 = this.queue.dequeue();
 
-  handleIceCandidates(socketId, roomId, iceCandidates) {
-    const room = this.rooms.get(roomId);
-    if (!room) return;
-    
-    const receiver = room.user1.id === socketId ? room.user2.id : room.user1.id;
-    this.io.to(receiver).emit("ice-candidates", iceCandidates);
-  }
+            if (user1 && user2) {
+                const roomId = this.createRoom(user1, user2);
+                this.io.to(user1.id).to(user2.id).emit('joined', { room: roomId });
+                this.io.to(user1.id).emit('send-offer');
+                console.log(`Room ${roomId} created for ${user1.id} and ${user2.id}`);
+            }
+        } else {
+            console.log("No pair found, user waiting in queue");
+        }
 
-  handleDisconnect(socketId) {
-    console.log(`DISCONNECTED :: ${socketId}`);
-    
-    // Remove from queue
-    const itemToRemove = this.queue.find(socketId);
-    this.numOfPlayers--;
-    this.queue.printQueue();
-    
-    if (itemToRemove) {
-      this.queue.remove(itemToRemove);
-      console.log(`Removed item with id ${socketId}.`);
+        this.io.emit('user-count', this.userCount);
     }
-    
-    this.queue.printQueue();
-    
-    // Handle room cleanup
-    this.rooms.forEach((room, roomId) => {
-      console.log(`ROOM :: ${roomId} USER1 :: ${room.user1.id} USER2 :: ${room.user2.id}`);
-      if (room.user1.id === socketId || room.user2.id === socketId) {
-        this.rooms.delete(roomId);
-        console.log(`DELETING ROOM :: ${roomId}`);
-        this.io.to(room.user1.id).to(room.user2.id).emit("leaveRoom");
-      }
-    });
-    
-    this.io.emit("user-count", this.numOfPlayers);
-  }
 
-  handleLeaveRoom(socketId) {
-    console.log(`LEAVING REQUEST FROM :: ${socketId}`);
-    
-    this.rooms.forEach((room, roomId) => {
-      console.log(`ROOM :: ${roomId} USER1 :: ${room.user1.id} USER2 :: ${room.user2.id}`);
-      if (room.user1.id === socketId || room.user2.id === socketId) {
-        this.rooms.delete(roomId);
-        console.log(`DELETING ROOM :: ${roomId}`);
-        this.io.to(room.user1.id).to(room.user2.id).emit("leaveRoom");
-      }
-    });
-  }
+    createRoom(user1, user2) {
+        const roomId = uuidv4();
+        this.rooms.set(roomId, { user1, user2 });
+        return roomId;
+    }
 
-  handleMessage(roomId, socketId, message) {
-    console.log(`MESSAGE RECEIVED IN :: ${roomId}`);
-    const room = this.rooms.get(roomId);
-    if (!room) return;
-    
-    const receiver = room.user1.id === socketId ? room.user2.id : room.user1.id;
-    this.io.to(receiver).emit("message", message);
-  }
+    handleOffer(socketId, roomId, offer) {
+        console.log(`Offer from ${socketId} for room ${roomId}`);
+        const room = this.rooms.get(roomId);
+        if (!room) return;
+
+        const receiver = room.user1.id === socketId ? room.user2.id : room.user1.id;
+        console.log(`Sending offer to ${receiver}`);
+        this.io.to(receiver).emit('offer', offer);
+    }
+
+    handleAnswer(socketId, roomId, answer) {
+        console.log(`Answer from ${socketId} for room ${roomId}`);
+        const room = this.rooms.get(roomId);
+        if (!room) return;
+
+        const receiver = room.user1.id === socketId ? room.user2.id : room.user1.id;
+        console.log(`Sending answer to ${receiver}`);
+        this.io.to(receiver).emit('answer', answer);
+    }
+
+    handleIceCandidates(socketId, roomId, iceCandidate) {
+        const room = this.rooms.get(roomId);
+        if (!room) return;
+
+        const receiver = room.user1.id === socketId ? room.user2.id : room.user1.id;
+        this.io.to(receiver).emit('ice-candidates', iceCandidate);
+    }
+
+    handleMessage(roomId, socketId, message) {
+        const room = this.rooms.get(roomId);
+        if (!room) return;
+
+        const receiver = room.user1.id === socketId ? room.user2.id : room.user1.id;
+        this.io.to(receiver).emit('message', message);
+    }
+
+    handleDisconnect(socketId) {
+        console.log(`User ${socketId} disconnected`);
+        
+        // Remove from queue
+        const itemToRemove = this.queue.find(socketId);
+        if (itemToRemove) {
+            this.queue.remove(itemToRemove);
+            console.log(`Removed ${socketId} from queue`);
+        }
+
+        this.userCount--;
+
+        // Handle room cleanup
+        this.rooms.forEach((room, roomId) => {
+            if (room.user1.id === socketId || room.user2.id === socketId) {
+                console.log(`Cleaning up room ${roomId}`);
+                this.rooms.delete(roomId);
+                this.io.to(room.user1.id).to(room.user2.id).emit('leaveRoom');
+            }
+        });
+
+        this.io.emit('user-count', this.userCount);
+    }
+
+    handleLeaveRoom(socketId) {
+        console.log(`Leave room request from ${socketId}`);
+        this.rooms.forEach((room, roomId) => {
+            if (room.user1.id === socketId || room.user2.id === socketId) {
+                this.rooms.delete(roomId);
+                this.io.to(room.user1.id).to(room.user2.id).emit('leaveRoom');
+            }
+        });
+    }
 }
 
-const manager = new RoomManager(io);
+const roomManager = new RoomManager(io);
 
-// Socket connection handling (from index.ts)
+// Socket connection handling
 io.on('connection', (socket) => {
-  console.log(`user connected :: ${socket.id}`);
+    console.log(`User connected: ${socket.id}`);
 
-  socket.on("join", () => {
-    console.log(`user joined :: ${socket.id}`);
-    manager.addUser(socket.id);
-  });
+    socket.on('join', () => {
+        console.log(`User joined: ${socket.id}`);
+        roomManager.addUser(socket.id);
+    });
 
-  socket.on("disconnect", () => {
-    console.log(`user disconnected :: ${socket.id}`);
-    manager.handleDisconnect(socket.id);
-  });
+    socket.on('offer', (roomId, offer) => {
+        roomManager.handleOffer(socket.id, roomId, offer);
+    });
 
-  socket.on("message", (roomId, message) => {
-    manager.handleMessage(roomId, socket.id, message);
-  });
+    socket.on('answer', (roomId, answer) => {
+        roomManager.handleAnswer(socket.id, roomId, answer);
+    });
 
-  socket.on("offer", (roomId, offer) => {
-    console.log("offer ->");
-    manager.handleOffer(socket.id, roomId, offer);
-  });
+    socket.on('ice-candidates', (roomId, iceCandidate) => {
+        roomManager.handleIceCandidates(socket.id, roomId, iceCandidate);
+    });
 
-  socket.on("answer", (roomId, answer) => {
-    console.log("answer ->");
-    manager.handleAnswer(socket.id, roomId, answer);
-  });
+    socket.on('message', (roomId, message) => {
+        roomManager.handleMessage(roomId, socket.id, message);
+    });
 
-  socket.on("ice-candidates", (roomId, iceCandidates) => {
-    console.log("iceCandidates ->");
-    manager.handleIceCandidates(socket.id, roomId, iceCandidates);
-  });
+    socket.on('leaveRoom', () => {
+        roomManager.handleLeaveRoom(socket.id);
+    });
 
-  socket.on("leaveRoom", (roomId) => {
-    console.log(`LEAVE ROOM REQUEST FROM ${socket.id}`);
-    manager.handleLeaveRoom(socket.id);
-  });
+    socket.on('disconnect', () => {
+        roomManager.handleDisconnect(socket.id);
+    });
 });
 
-// API Routes
+// Simple health check
 app.get('/', (req, res) => {
-  return res.json({
-    status: "OmeLive Server - ONLINE",
-    version: "2.0.0",
-    timestamp: new Date().toISOString(),
-    activeUsers: manager.numOfPlayers,
-    queueSize: manager.queue.size(),
-    activeRooms: manager.rooms.size
-  });
+    res.json({
+        status: 'OmeLive Server Online',
+        users: roomManager.userCount,
+        rooms: roomManager.rooms.size,
+        timestamp: new Date().toISOString()
+    });
 });
 
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    uptime: Math.floor(process.uptime()),
-    activeUsers: manager.numOfPlayers,
-    timestamp: new Date().toISOString()
-  });
-});
-
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`listening on *: ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
-
-module.exports = { app, server, io, manager };
